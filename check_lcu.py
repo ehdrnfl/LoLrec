@@ -1,14 +1,29 @@
+import os
 from pathlib import Path
-import time
+
 import requests
 import urllib3
-
-# 설치 위치가 다르면 이 경로를 수정하세요.
-LOCKFILE = Path(r"C:\Riot Games\League of Legends\lockfile")
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Data Dragon에서 챔피언 ID → 한국어 이름 사전을 한 번 가져옵니다.
+LOCKFILE = Path(r"C:\Riot Games\League of Legends\lockfile")
+FRONTEND_ORIGIN = os.getenv(
+    "FRONTEND_ORIGIN",
+    "http://localhost:3000",
+)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
 def load_champion_names():
     try:
         versions = requests.get(
@@ -25,56 +40,55 @@ def load_champion_names():
         )
         response.raise_for_status()
 
-        champion_data = response.json()["data"]
+        champions = response.json()["data"]
         return {
             champion["key"]: champion["name"]
-            for champion in champion_data.values()
+            for champion in champions.values()
         }
-    except (requests.RequestException, KeyError, IndexError) as e:
-        print(f"챔피언 이름 목록을 가져오지 못했습니다: {e}")
+    except (requests.RequestException, KeyError, IndexError):
         return {}
 
-champion_names = load_champion_names()
+CHAMPION_NAMES = load_champion_names()
 
 def champion_name(champion_id):
     if not champion_id:
         return "미선택"
-    return champion_names.get(
+    return CHAMPION_NAMES.get(
         str(champion_id),
-        f"이름 확인 불가 (ID: {champion_id})",
+        f"챔피언 ID {champion_id}",
     )
 
-if not LOCKFILE.exists():
-    raise SystemExit(
-        f"lockfile을 찾지 못했습니다: {LOCKFILE}\n"
-        "League of Legends 설치 폴더 안의 lockfile 경로를 확인하세요."
-    )
-
-# lockfile 형식: 프로세스명:PID:포트:토큰:프로토콜
-parts = LOCKFILE.read_text(encoding="utf-8").strip().split(":")
-if len(parts) < 5:
-    raise SystemExit("lockfile 형식을 읽지 못했습니다.")
-
-_, _, port, token, protocol = parts[:5]
-url = f"{protocol}://127.0.0.1:{port}/lol-champ-select/v1/session"
-
-print(f"LCU_PORT: {port}")
-print("LCU_TOKEN: 읽음 (화면에는 표시하지 않음)")
-print("밴픽 세션 조회 중 — 종료하려면 Ctrl+C를 누르세요.")
-
-last_output = None
-
-def team_summary(team):
+def summarize_team(team):
     return [
         {
             "champion": champion_name(player.get("championId")),
-            "position": player.get("assignedPosition") or "미정",
+            "position": player.get("assignedPosition") or "포지션 미정",
         }
         for player in team
     ]
 
-while True:
+@app.get("/api/draft")
+def get_draft():
+    if not LOCKFILE.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="League Client lockfile을 찾지 못했습니다.",
+        )
+
     try:
+        parts = LOCKFILE.read_text(encoding="utf-8").strip().split(":")
+        if len(parts) < 5:
+            raise HTTPException(
+                status_code=503,
+                detail="lockfile 형식을 읽지 못했습니다.",
+            )
+
+        _, _, port, token, protocol = parts[:5]
+        url = (
+            f"{protocol}://127.0.0.1:{port}"
+            "/lol-champ-select/v1/session"
+        )
+
         response = requests.get(
             url,
             auth=("riot", token),
@@ -83,39 +97,34 @@ while True:
         )
 
         if response.status_code == 404:
-            output = "현재 챔피언 선택 세션이 없습니다."
-        else:
-            response.raise_for_status()
-            data = response.json()
-
-            timer = data.get("timer") or {}
-            bans = data.get("bans") or {}
-
-            output = {
-                "phase": timer.get("phase", "정보 없음"),
-                "myTeam": team_summary(data.get("myTeam", [])),
-                "theirTeam": team_summary(data.get("theirTeam", [])),
-                "myTeamBans": [
-                    champion_name(champ_id)
-                    for champ_id in bans.get("myTeamBans", [])
-                ],
-                "theirTeamBans": [
-                    champion_name(champ_id)
-                    for champ_id in bans.get("theirTeamBans", [])
-                ],
+            return {
+                "inChampSelect": False,
+                "message": "현재 챔피언 선택 세션이 없습니다.",
             }
 
-        text = str(output)
-        if text != last_output:
-            print("\n", output)
-            last_output = text
+        response.raise_for_status()
+        data = response.json()
 
-    except requests.exceptions.ConnectionError:
-        print("LCU 연결 실패 — 클라이언트가 실행 중인지 확인하세요.")
-        break
-    except requests.exceptions.HTTPError as e:
-        print(f"LCU 응답 오류: {e}")
-        break
-    except KeyboardInterrupt:
-        print("\n종료합니다.")
-        break
+        timer = data.get("timer") or {}
+        bans = data.get("bans") or {}
+
+        return {
+            "inChampSelect": True,
+            "phase": timer.get("phase", "단계 정보 없음"),
+            "myTeam": summarize_team(data.get("myTeam", [])),
+            "theirTeam": summarize_team(data.get("theirTeam", [])),
+            "myTeamBans": [
+                champion_name(champ_id)
+                for champ_id in bans.get("myTeamBans", [])
+            ],
+            "theirTeamBans": [
+                champion_name(champ_id)
+                for champ_id in bans.get("theirTeamBans", [])
+            ],
+        }
+
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"LCU 연결 실패: {e}",
+        )
